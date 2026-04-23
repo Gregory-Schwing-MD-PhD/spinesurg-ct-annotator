@@ -1,5 +1,5 @@
 {
-  "_comment": "Maps HF username -> list of case_ids they may annotate. The '*' key broadcasts to every authenticated user. Under versioned saves (option 3), assigning multiple users to the same case_id is a feature — each save gets its own file.",
-  "greg-schwing": [],
+  "_comment": "Maps HF username -> list of case_ids they may annotate. case_id is the filename base used in the source dataset's ct/ and labels/ directories, e.g. '0189_unknown' for fused cases or '0401_unknown_pelvic' for separate-pelvic views. The '*' key broadcasts to every authenticated user. Under versioned saves (option 3), assigning multiple users to the same case_id is a feature — each save gets its own file and you get inter-rater variability for free.",
+  "gregoryschwingmdphd": [],
   "*": []
 }

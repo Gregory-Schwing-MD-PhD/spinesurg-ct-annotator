@@ -1,14 +1,24 @@
 """
 Hugging Face dataset sync.
 
-Two responsibilities:
-  1. Lazy-download CT volumes from the SOURCE dataset on first access.
-     (Avoids pulling hundreds of GB on every cold start.)
-  2. On every save:
-        a) Write a versioned mask to /workspace/labels/<case>/<user>_<iso>.nii.gz
-        b) Audit-log the event.
-        c) Fire-and-forget push of the mask + updated audit DB to the TARGET
-           dataset via huggingface_hub.
+Source dataset layout (CTSpinoPelvic1K, flat):
+    ct/{case_id}_ct.nii.gz
+    labels/{case_id}_label.nii.gz
+
+where case_id follows export_hf.py's filename convention:
+    {token:04d}_{position}                       # fused
+    {token:04d}_{position}_spine                  # separate, spine view
+    {token:04d}_{position}_pelvic                 # separate, pelvic view
+    e.g. "0189_unknown", "0401_unknown_pelvic"
+
+Target dataset layout (CTSpinoPelvic1K-annotations):
+    labels/{case_id}/{username}_{ISO8601}.nii.gz  # versioned refinements
+    audit.sqlite                                   # provenance DB
+
+The source label is offered to OHIF as a starting segmentation so clinicians
+refine rather than redraw. This matches the paper's thesis: TotalSegmentator's
+automated labels have a 19.6 junction-DSC gap on LSTV cases, so the value of
+the annotation pass is corrective.
 """
 from __future__ import annotations
 
@@ -28,7 +38,6 @@ _SAFE = re.compile(r"[^A-Za-z0-9_\-]")
 
 
 def _sanitize(s: str) -> str:
-    """Make a string safe for use in a filename."""
     return _SAFE.sub("_", s)
 
 
@@ -55,62 +64,78 @@ class SyncManager:
         self.api = HfApi(token=hf_token)
         self.audit = audit_logger
 
-        # Serialize uploads to avoid rate-limit thrashing from concurrent
-        # saves. Individual saves are already cheap; queuing pushes is fine.
+        # Serialize uploads to avoid rate-limit thrashing from concurrent saves.
         self._upload_lock = asyncio.Lock()
 
     # --------------------------------------------------------------------- #
-    # Source dataset — lazy download                                        #
+    # Source dataset — lazy per-case download                               #
     # --------------------------------------------------------------------- #
 
-    def ensure_case(self, case_id: str) -> Path:
-        """Download ct.nii.gz for a case if not already cached. Idempotent."""
-        safe_case = _sanitize(case_id)
-        local_dir = self.raw / safe_case
-        local_path = local_dir / "ct.nii.gz"
+    def ensure_case(self, case_id: str) -> dict:
+        """
+        Ensure CT + source label for a case are present locally. Idempotent.
 
-        if local_path.exists():
-            return local_path
+        Returns paths so the caller (FastAPI) can pass them to MONAI Label's
+        datastore for registration. The source label is the *starting* mask —
+        OHIF loads it and the annotator refines on top.
+        """
+        safe = _sanitize(case_id)
+        case_dir = self.raw / safe
+        case_dir.mkdir(parents=True, exist_ok=True)
 
-        local_dir.mkdir(parents=True, exist_ok=True)
+        local_ct = case_dir / "ct.nii.gz"
+        local_seed_label = case_dir / "seed_label.nii.gz"
 
-        # Try a few plausible layouts; CTSpinoPelvic1K's hf_export is primary.
-        candidate_filenames = [
-            f"hf_export/{case_id}/ct.nii.gz",
-            f"{case_id}/ct.nii.gz",
-            f"images/{case_id}.nii.gz",
-        ]
-        last_err: Exception | None = None
-        for filename in candidate_filenames:
+        ct_remote = f"ct/{case_id}_ct.nii.gz"
+        label_remote = f"labels/{case_id}_label.nii.gz"
+
+        if not local_ct.exists():
             try:
                 downloaded = hf_hub_download(
                     repo_id=self.source,
-                    filename=filename,
+                    filename=ct_remote,
                     repo_type="dataset",
                     token=self.token,
                 )
-                # Symlink (or copy) to our expected layout.
-                if not local_path.exists():
-                    try:
-                        local_path.symlink_to(downloaded)
-                    except OSError:
-                        local_path.write_bytes(Path(downloaded).read_bytes())
-                return local_path
+                self._link_or_copy(Path(downloaded), local_ct)
             except EntryNotFoundError as e:
-                last_err = e
-                continue
+                raise FileNotFoundError(
+                    f"CT not found for case {case_id!r} at {ct_remote} "
+                    f"in {self.source}: {e}"
+                ) from e
 
-        raise FileNotFoundError(
-            f"Could not locate ct.nii.gz for case {case_id!r} in {self.source}. "
-            f"Tried: {candidate_filenames}. Last error: {last_err}"
-        )
+        # Seed label is optional — future datasets may not ship one.
+        if not local_seed_label.exists():
+            try:
+                downloaded = hf_hub_download(
+                    repo_id=self.source,
+                    filename=label_remote,
+                    repo_type="dataset",
+                    token=self.token,
+                )
+                self._link_or_copy(Path(downloaded), local_seed_label)
+            except EntryNotFoundError:
+                log.info("No seed label for %s; annotator starts from blank", case_id)
+
+        return {
+            "ct": str(local_ct),
+            "seed_label": str(local_seed_label) if local_seed_label.exists() else None,
+            "case_dir": str(case_dir),
+        }
+
+    @staticmethod
+    def _link_or_copy(src: Path, dst: Path) -> None:
+        try:
+            dst.symlink_to(src)
+        except OSError:
+            dst.write_bytes(src.read_bytes())
 
     # --------------------------------------------------------------------- #
-    # Target dataset — versioned saves                                      #
+    # Target dataset — versioned saves (option 3)                           #
     # --------------------------------------------------------------------- #
 
     def _versioned_mask_path(self, case_id: str, username: str) -> Path:
-        """labels/<case>/<user>_<ISO8601>.nii.gz — option 3."""
+        """labels/<case>/<user>_<ISO8601>.nii.gz — concurrent-safe."""
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         case_dir = self.labels / _sanitize(case_id)
         case_dir.mkdir(parents=True, exist_ok=True)
@@ -123,21 +148,20 @@ class SyncManager:
         mask_bytes: bytes,
         session_id: str,
     ) -> dict:
-        """Persist mask locally, log the event, kick off the HF push."""
+        """Persist refined mask locally, log the event, push to target dataset."""
         out = self._versioned_mask_path(case_id, username)
-        # Write via a thread so we don't block the event loop on large volumes.
         await asyncio.to_thread(out.write_bytes, mask_bytes)
 
         sha = self.audit.log_annotation(
             username=username,
             case_id=case_id,
-            source_filename=f"{case_id}/ct.nii.gz",
+            source_filename=f"ct/{case_id}_ct.nii.gz",
             mask_filename=str(out.relative_to(self.workspace)),
             mask_bytes=mask_bytes,
             session_id=session_id,
         )
 
-        # Fire-and-forget. We don't want OHIF to hang on HF's response time.
+        # Fire-and-forget — OHIF shouldn't wait on HF's response time.
         asyncio.create_task(self._push_artifacts(out, sha, case_id, username))
 
         return {
@@ -149,12 +173,7 @@ class SyncManager:
     async def _push_artifacts(
         self, mask_path: Path, sha: str, case_id: str, username: str,
     ) -> None:
-        """Push the mask + audit DB to the target dataset.
-
-        Kept simple: two upload_file calls. For very high throughput we'd
-        batch into upload_folder with a create_commit, but per-save commits
-        give us clean per-annotation history.
-        """
+        """Upload the refined mask and the updated audit DB to target."""
         async with self._upload_lock:
             try:
                 await asyncio.to_thread(
