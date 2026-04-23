@@ -1,0 +1,5 @@
+{
+  "_comment": "Maps HF username -> list of case_ids they may annotate. The '*' key broadcasts to every authenticated user. Under versioned saves (option 3), assigning multiple users to the same case_id is a feature — each save gets its own file.",
+  "greg-schwing": [],
+  "*": []
+}

@@ -1,0 +1,9 @@
+fastapi>=0.115,<0.120
+uvicorn[standard]>=0.30,<0.33
+httpx>=0.27,<0.29
+authlib>=1.3,<1.5
+itsdangerous>=2.2
+pydantic>=2.8
+pydantic-settings>=2.5
+huggingface_hub>=0.25,<0.30
+python-multipart>=0.0.9

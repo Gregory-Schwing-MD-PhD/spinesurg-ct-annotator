@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Env / secrets
+.env
+.env.local
+
+# Runtime state
+workspace/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.hf_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docker
+.dockerignore
