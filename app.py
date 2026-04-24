@@ -24,7 +24,7 @@ from pathlib import Path
 import httpx
 from authlib.integrations.starlette_client import OAuth
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from audit import AuditLogger
@@ -423,9 +423,134 @@ async def proxy_all(path: str, request: Request):
     return await _proxy(request, path)
 
 
-# Root → OHIF index (served by MONAI Label at /ohif/).
-@app.get("/")
-async def root(request: Request):
+# --------------------------------------------------------------------------- #
+# Landing page — case picker                                                  #
+# --------------------------------------------------------------------------- #
+
+_LANDING_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SpineSurg CT Annotator</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #1e293b; --border: #334155;
+      --ink: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --accent-ink: #0f172a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 2.5rem 1.5rem; min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--ink); line-height: 1.5;
+    }
+    .wrap { max-width: 880px; margin: 0 auto; }
+    header {
+      display: flex; justify-content: space-between; align-items: baseline;
+      border-bottom: 1px solid var(--border); padding-bottom: 1rem;
+      margin-bottom: 2rem;
+    }
+    h1 { font-size: 1.5rem; margin: 0; font-weight: 600; }
+    .user { font-size: 0.875rem; color: var(--muted); }
+    .user a { color: var(--accent); text-decoration: none; margin-left: 0.75rem; }
+    h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.05em;
+         color: var(--muted); font-weight: 500; margin: 2rem 0 0.75rem; }
+    .cases { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+             gap: 0.75rem; }
+    .case {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 6px; padding: 1rem;
+      text-decoration: none; color: inherit; font-family: ui-monospace, monospace;
+      font-size: 0.875rem; transition: all 0.15s;
+    }
+    .case:hover { border-color: var(--accent); background: #273449; }
+    .empty {
+      background: var(--panel); border: 1px dashed var(--border); border-radius: 6px;
+      padding: 2rem; text-align: center; color: var(--muted);
+    }
+    .empty code {
+      background: #000; padding: 0.1rem 0.35rem; border-radius: 3px; color: var(--accent);
+    }
+    .meta { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>SpineSurg CT Annotator</h1>
+    <div class="user">
+      signed in as <strong>__USERNAME__</strong>
+      <a href="/logout">sign out</a>
+    </div>
+  </header>
+
+  <h2>Your assigned cases</h2>
+  __CASES_HTML__
+
+  <p class="meta">
+    Click a case to open it in the OHIF viewer. Saves are versioned per
+    annotator — your refinements never overwrite another reader's work.
+  </p>
+</div>
+</body>
+</html>
+"""
+
+
+def _render_landing(username: str, cases: list[str]) -> str:
+    if cases:
+        cards = "\n".join(
+            f'<a class="case" href="/open/{c}">{c}</a>' for c in cases
+        )
+        cases_html = f'<div class="cases">{cards}</div>'
+    else:
+        cases_html = (
+            '<div class="empty">'
+            "No cases assigned yet. Edit "
+            "<code>assignments.json</code> in the GitHub repo and push."
+            "</div>"
+        )
+    return (
+        _LANDING_TEMPLATE
+        .replace("__USERNAME__", username)
+        .replace("__CASES_HTML__", cases_html)
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def landing(request: Request):
     if "user" not in request.session:
         return RedirectResponse("/login")
-    return RedirectResponse(settings.ohif_path)
+    username = request.session["user"]
+    # Reuse the same logic as /api/my-cases.
+    if ASSIGNMENTS_PATH.exists():
+        data = json.loads(ASSIGNMENTS_PATH.read_text())
+        cases = list(dict.fromkeys(data.get(username, []) + data.get("*", [])))
+    else:
+        cases = []
+    # Don't surface the placeholder _comment field as a "case".
+    cases = [c for c in cases if not c.startswith("_")]
+    return HTMLResponse(_render_landing(username, cases))
+
+
+@app.get("/open/{case_id}")
+async def open_case(case_id: str, request: Request):
+    """Preload a case's CT + seed label, then redirect into OHIF."""
+    if "user" not in request.session:
+        return RedirectResponse(f"/login?next=/open/{case_id}")
+    username = request.session["user"]
+    if not user_has_case(username, case_id):
+        raise HTTPException(
+            403, f"User {username!r} is not assigned to case {case_id!r}"
+        )
+    try:
+        await asyncio.to_thread(sync.ensure_case, case_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception:
+        log.exception("ensure_case failed for %s", case_id)
+        raise HTTPException(500, "Failed to stage case files")
+
+    # OHIF reads the datastore MONAI Label serves; the study appears once
+    # ensure_case has linked the files into /workspace/raw_data. OHIF's
+    # StudyList URL is stable across MONAI Label versions.
+    return RedirectResponse(f"{settings.ohif_path}")
