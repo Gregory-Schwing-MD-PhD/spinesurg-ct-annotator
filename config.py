@@ -37,8 +37,11 @@ class Settings(BaseSettings):
 
     # MONAI Label subprocess
     monai_port: int = 8000
-    monai_app_path: str = "/opt/monailabel/sample-apps/radiology"
-    monai_models: str = "segmentation_spine"
+    monai_app_path: str = "/workspace/apps/radiology"
+    # Annotation-only by default: no model loaded, no GPU needed. When a
+    # trained spinesurg-ct-nnunet checkpoint is ready, set this to the
+    # bundle name to enable live pre-labeling.
+    monai_models: str = ""
     monai_boot_timeout_s: int = 120
     ohif_path: str = "/ohif/"
 
