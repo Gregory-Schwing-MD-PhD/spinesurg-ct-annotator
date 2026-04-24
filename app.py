@@ -14,6 +14,8 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import subprocess
@@ -66,6 +68,60 @@ ASSIGNMENTS_PATH = Path(__file__).parent / "assignments.json"
 
 # Endpoints that bypass the auth wall.
 PUBLIC_PATHS: set[str] = {"login", "logout", "auth/callback", "healthz", "favicon.ico"}
+
+
+# --------------------------------------------------------------------------- #
+# API tokens for Slicer                                                       #
+# --------------------------------------------------------------------------- #
+# Slicer's MONAI Label module isn't a browser — it can't follow the OAuth
+# redirect chain. Instead we issue a per-user API token, derived as an HMAC of
+# the username with the session secret. Deterministic (no DB needed), bound
+# to one user, revokable by rotating SESSION_SECRET. Users paste it into
+# Slicer's "Authorization" field (Basic Auth: username + token-as-password).
+
+
+def user_api_token(username: str) -> str:
+    """Stable per-user API token derived from the session secret."""
+    mac = hmac.new(
+        settings.session_secret.encode("utf-8"),
+        username.encode("utf-8"),
+        hashlib.sha256,
+    )
+    # URL-safe base64-ish; first 32 hex chars is plenty of entropy for this.
+    return mac.hexdigest()[:32]
+
+
+def username_from_request(request: Request) -> str | None:
+    """Resolve the acting user from either a session cookie (browser) or
+    a Basic/Bearer auth header (Slicer). Returns username or None."""
+    # 1. Session cookie (browser users who went through OAuth).
+    user = request.session.get("user")
+    if user:
+        return user
+
+    # 2. Authorization header (Slicer users).
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Basic "):
+        import base64
+        try:
+            raw = base64.b64decode(auth[6:]).decode("utf-8", errors="replace")
+            user_part, _, token = raw.partition(":")
+        except Exception:
+            return None
+        if user_part and token and hmac.compare_digest(
+            token, user_api_token(user_part)
+        ):
+            return user_part
+    elif auth.startswith("Bearer "):
+        # Bearer <username>:<token> — simple format, one header value.
+        token_part = auth[7:].strip()
+        if ":" in token_part:
+            user_part, token = token_part.split(":", 1)
+            if user_part and hmac.compare_digest(
+                token, user_api_token(user_part)
+            ):
+                return user_part
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -169,12 +225,29 @@ app.add_middleware(
 
 
 def require_user(request: Request) -> tuple[str, str]:
-    """Return (username, session_id) or raise 401."""
+    """Return (username, session_id) or raise 401.
+
+    Accepts either a session cookie (browser users) or Basic/Bearer
+    Authorization (Slicer users). For API-token callers we synthesize a
+    session_id from the request — it's only used for audit correlation
+    and doesn't need to match a real session record.
+    """
     user = request.session.get("user")
     sid = request.session.get("session_id")
-    if not user or not sid:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return user, sid
+    if user and sid:
+        return user, sid
+
+    api_user = username_from_request(request)
+    if api_user:
+        # Deterministic per-request "session" identifier: prefix plus a
+        # truncated uuid so audit rows can correlate a Slicer save burst.
+        return api_user, f"slicer-{uuid.uuid4().hex[:12]}"
+
+    raise HTTPException(
+        status_code=401,
+        detail="Not authenticated",
+        headers={"WWW-Authenticate": 'Basic realm="SpineSurg"'},
+    )
 
 
 def user_has_case(username: str, case_id: str) -> bool:
@@ -421,13 +494,14 @@ _LANDING_TEMPLATE = """<!doctype html>
   <style>
     :root {
       --bg: #0f172a; --panel: #1e293b; --border: #334155;
-      --ink: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --accent-ink: #0f172a;
+      --ink: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
+      --accent-ink: #0f172a; --ok: #22c55e; --warn: #fbbf24;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0; padding: 2.5rem 1.5rem; min-height: 100vh;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg); color: var(--ink); line-height: 1.5;
+      background: var(--bg); color: var(--ink); line-height: 1.55;
     }
     .wrap { max-width: 880px; margin: 0 auto; }
     header {
@@ -438,25 +512,63 @@ _LANDING_TEMPLATE = """<!doctype html>
     h1 { font-size: 1.5rem; margin: 0; font-weight: 600; }
     .user { font-size: 0.875rem; color: var(--muted); }
     .user a { color: var(--accent); text-decoration: none; margin-left: 0.75rem; }
-    h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.05em;
-         color: var(--muted); font-weight: 500; margin: 2rem 0 0.75rem; }
-    .cases { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-             gap: 0.75rem; }
-    .case {
+    h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.08em;
+         color: var(--muted); font-weight: 600; margin: 2.5rem 0 0.75rem; }
+    .panel {
       background: var(--panel); border: 1px solid var(--border);
-      border-radius: 6px; padding: 1rem;
-      text-decoration: none; color: inherit; font-family: ui-monospace, monospace;
-      font-size: 0.875rem; transition: all 0.15s;
+      border-radius: 8px; padding: 1.25rem 1.5rem; margin-bottom: 0.75rem;
     }
-    .case:hover { border-color: var(--accent); background: #273449; }
+    .step-num {
+      display: inline-block; width: 1.5rem; height: 1.5rem; line-height: 1.5rem;
+      background: var(--accent); color: var(--accent-ink); border-radius: 50%;
+      text-align: center; font-weight: 700; font-size: 0.8rem; margin-right: 0.5rem;
+    }
+    .url-box {
+      display: flex; align-items: stretch; gap: 0; margin: 0.75rem 0;
+      border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+    }
+    .url-box code {
+      flex: 1; padding: 0.75rem 1rem; background: #000; color: var(--accent);
+      font-size: 0.9rem; overflow-x: auto; white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+    .url-box button {
+      padding: 0 1rem; background: var(--accent); color: var(--accent-ink);
+      border: none; cursor: pointer; font-weight: 600; font-size: 0.85rem;
+    }
+    .url-box button:hover { filter: brightness(1.1); }
+    .url-box button.copied { background: var(--ok); }
+    a.dl {
+      display: inline-block; padding: 0.6rem 1rem; background: var(--accent);
+      color: var(--accent-ink); border-radius: 6px; text-decoration: none;
+      font-weight: 600; font-size: 0.9rem; margin-top: 0.5rem;
+    }
+    a.dl:hover { filter: brightness(1.1); }
+    .cases { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+             gap: 0.5rem; }
+    .case {
+      background: #0b1220; border: 1px solid var(--border); border-radius: 5px;
+      padding: 0.5rem 0.75rem; font-family: ui-monospace, monospace;
+      font-size: 0.82rem; color: var(--ink);
+    }
     .empty {
       background: var(--panel); border: 1px dashed var(--border); border-radius: 6px;
-      padding: 2rem; text-align: center; color: var(--muted);
+      padding: 1.5rem; text-align: center; color: var(--muted); font-size: 0.9rem;
     }
     .empty code {
       background: #000; padding: 0.1rem 0.35rem; border-radius: 3px; color: var(--accent);
     }
-    .meta { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; }
+    .status-line { font-size: 0.85rem; color: var(--muted); margin-top: 0.5rem; }
+    .status-line.ok::before { content: "●  "; color: var(--ok); }
+    .status-line.pending::before { content: "●  "; color: var(--warn); }
+    p { margin: 0.5rem 0; }
+    ul { margin: 0.5rem 0; padding-left: 1.25rem; }
+    li { margin: 0.25rem 0; }
+    .small { font-size: 0.82rem; color: var(--muted); }
+    kbd {
+      background: #000; border: 1px solid var(--border); border-radius: 3px;
+      padding: 0.1rem 0.35rem; font-size: 0.8rem; font-family: ui-monospace, monospace;
+    }
   </style>
 </head>
 <body>
@@ -469,37 +581,160 @@ _LANDING_TEMPLATE = """<!doctype html>
     </div>
   </header>
 
-  <h2>Your assigned cases</h2>
-  __CASES_HTML__
+  <h2>Setup (one time)</h2>
 
-  <p class="meta">
-    Click a case to open it in the OHIF viewer. Saves are versioned per
-    annotator — your refinements never overwrite another reader's work.
-  </p>
+  <div class="panel">
+    <p><span class="step-num">1</span><strong>Install 3D Slicer</strong> (free, cross-platform).</p>
+    <a class="dl" href="https://download.slicer.org/" target="_blank" rel="noopener">Download 3D Slicer →</a>
+    <p class="small">Any stable release 5.0+ works. Install, then launch.</p>
+  </div>
+
+  <div class="panel">
+    <p><span class="step-num">2</span><strong>Install the MONAI Label extension.</strong></p>
+    <p>In Slicer: <kbd>View</kbd> → <kbd>Extensions Manager</kbd>, search for <strong>MONAI Label</strong>, install, restart Slicer.</p>
+  </div>
+
+  <div class="panel">
+    <p><span class="step-num">3</span><strong>Connect Slicer to this server.</strong></p>
+    <p>In Slicer, switch to the <em>MONAI Label</em> module (module dropdown). Paste this URL into the <em>MONAI Label server</em> field and click <kbd>▼</kbd> to connect:</p>
+    <div class="url-box">
+      <code id="server-url">__SERVER_URL__</code>
+      <button onclick="copyUrl('server-url', 'copy-url-btn')" id="copy-url-btn">Copy</button>
+    </div>
+    <p class="small">When Slicer prompts for authentication, use:</p>
+    <p class="small"><strong>Username:</strong> <code style="background:#000;padding:0.1rem 0.4rem;border-radius:3px;color:var(--accent)">__USERNAME__</code></p>
+    <div class="url-box">
+      <code id="api-token">__API_TOKEN__</code>
+      <button onclick="copyUrl('api-token', 'copy-token-btn')" id="copy-token-btn">Copy token</button>
+    </div>
+    <p class="small">This token is personal to you — it's derived from your HF username and rotates if the project admin rotates the server secret. <strong>Don't share it.</strong></p>
+  </div>
+
+  <h2>Your assigned cases</h2>
+
+  <div class="panel">
+    __CASES_HTML__
+    <p class="status-line __STAGE_CLASS__">__STAGE_STATUS__</p>
+  </div>
+
+  <h2>Workflow</h2>
+
+  <div class="panel">
+    <ul>
+      <li>In Slicer's MONAI Label panel, click <kbd>Next Sample</kbd> to load an unlabeled case.</li>
+      <li>The seed segmentation (from TotalSegmentator + CTSpine1K/CTPelvic1K fused labels) is loaded automatically. Your job is to <strong>refine</strong>, especially around the lumbosacral junction on LSTV cases.</li>
+      <li>Use the <em>Segment Editor</em> tools: Paint, Erase, Threshold, Islands, Smoothing.</li>
+      <li>Click <kbd>Submit Label</kbd> to save. Your mask is versioned as <code>&lt;your-username&gt;_&lt;timestamp&gt;.nii.gz</code> and auto-pushed to the private annotations dataset.</li>
+      <li>Saves never overwrite another annotator's work — multiple readers on the same case give us inter-rater variability by design.</li>
+    </ul>
+  </div>
+
 </div>
+
+<script>
+function copyUrl(targetId, btnId) {
+  const text = document.getElementById(targetId).textContent;
+  navigator.clipboard.writeText(text);
+  const btn = document.getElementById(btnId);
+  const original = btn.textContent;
+  btn.textContent = 'Copied ✓';
+  btn.classList.add('copied');
+  setTimeout(() => {
+    btn.textContent = original;
+    btn.classList.remove('copied');
+  }, 1800);
+}
+</script>
 </body>
 </html>
 """
 
 
-def _render_landing(username: str, cases: list[str]) -> str:
+def _render_landing(
+    username: str,
+    cases: list[str],
+    server_url: str,
+    api_token: str,
+    stage_done: bool,
+) -> str:
     if cases:
-        cards = "\n".join(
-            f'<a class="case" href="/open/{c}">{c}</a>' for c in cases
-        )
+        cards = "\n".join(f'<span class="case">{c}</span>' for c in cases)
         cases_html = f'<div class="cases">{cards}</div>'
+        stage_status = (
+            f"{len(cases)} case{'s' if len(cases) != 1 else ''} ready in Slicer."
+            if stage_done
+            else f"Preparing {len(cases)} case{'s' if len(cases) != 1 else ''}… "
+                 "refresh this page in a moment."
+        )
+        stage_class = "ok" if stage_done else "pending"
     else:
         cases_html = (
             '<div class="empty">'
-            "No cases assigned yet. Edit "
-            "<code>assignments.json</code> in the GitHub repo and push."
+            "No cases assigned yet. Ask the project admin to add you to "
+            "<code>assignments.json</code>."
             "</div>"
         )
+        stage_status = ""
+        stage_class = ""
     return (
         _LANDING_TEMPLATE
         .replace("__USERNAME__", username)
+        .replace("__SERVER_URL__", server_url)
+        .replace("__API_TOKEN__", api_token)
         .replace("__CASES_HTML__", cases_html)
+        .replace("__STAGE_CLASS__", stage_class)
+        .replace("__STAGE_STATUS__", stage_status)
     )
+
+
+# Module-level tracker of which case-sets have been staged already this boot.
+# Key: tuple of sorted case_ids. Value: asyncio.Task (pending) or True (done).
+_STAGE_TASKS: dict[tuple, object] = {}
+
+
+async def _stage_cases_bg(case_ids: list[str]) -> None:
+    """Download every case's CT + seed label from the source HF dataset.
+
+    Slicer's MONAI Label module queries `/datastore/` to list available
+    studies; anything already materialized in /workspace/raw_data by
+    ensure_case() shows up immediately. Staging all assigned cases at
+    login time means annotators click 'Next Sample' in Slicer and the
+    case is instantly available — no per-case pre-fetch latency.
+    """
+    for cid in case_ids:
+        try:
+            await asyncio.to_thread(sync.ensure_case, cid)
+            log.info("staged %s", cid)
+        except Exception:
+            log.exception("stage failed for %s", cid)
+
+
+def _trigger_staging(case_ids: list[str]) -> bool:
+    """Kick off staging for a case set if not already staged. Returns True
+    if staging has completed (files are ready on disk)."""
+    if not case_ids:
+        return True
+    key = tuple(sorted(case_ids))
+    prior = _STAGE_TASKS.get(key)
+    if prior is True:
+        return True
+    if prior is None:
+        task = asyncio.create_task(_stage_cases_bg(case_ids))
+        _STAGE_TASKS[key] = task
+
+        def _done(t):
+            # Whatever happens, mark staging as complete so a failed
+            # fetch doesn't block the user forever — they can still
+            # annotate whatever cases did make it.
+            _STAGE_TASKS[key] = True
+
+        task.add_done_callback(_done)
+        return False
+    # Task in progress — check if it's actually finished.
+    if isinstance(prior, asyncio.Task) and prior.done():
+        _STAGE_TASKS[key] = True
+        return True
+    return False
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -507,53 +742,37 @@ async def landing(request: Request):
     if "user" not in request.session:
         return RedirectResponse("/login")
     username = request.session["user"]
-    # Reuse the same logic as /api/my-cases.
     if ASSIGNMENTS_PATH.exists():
         data = json.loads(ASSIGNMENTS_PATH.read_text())
         cases = list(dict.fromkeys(data.get(username, []) + data.get("*", [])))
     else:
         cases = []
-    # Don't surface the placeholder _comment field as a "case".
     cases = [c for c in cases if not c.startswith("_")]
+
+    # Kick off background staging of every assigned case so Slicer sees
+    # them as soon as the annotator clicks Next Sample.
+    stage_done = _trigger_staging(cases)
+
+    # Build the server URL that Slicer's MONAI Label extension needs. It's
+    # just the Space's external URL — FastAPI proxies /datastore, /info,
+    # /infer etc. through to the MONAI Label subprocess.
+    server_url = str(request.base_url).rstrip("/")
+
+    api_token = user_api_token(username)
+
     return HTMLResponse(
-        _render_landing(username, cases),
+        _render_landing(username, cases, server_url, api_token, stage_done),
         headers={
-            # Defeat aggressive browser + HF-edge caching. Without these,
-            # an old 302 (from when `/` redirected to /ohif/) or an OHIF
-            # service-worker registration can keep serving stale content
-            # even after the route is updated.
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
-            # Tell browsers to unregister any service workers registered on
-            # this origin. OHIF's SW can otherwise intercept navigations.
-            "Clear-Site-Data": '"cache", "storage"',
         },
     )
 
 
-@app.get("/open/{case_id}")
-async def open_case(case_id: str, request: Request):
-    """Preload a case's CT + seed label, then redirect into OHIF."""
-    if "user" not in request.session:
-        return RedirectResponse(f"/login?next=/open/{case_id}")
-    username = request.session["user"]
-    if not user_has_case(username, case_id):
-        raise HTTPException(
-            403, f"User {username!r} is not assigned to case {case_id!r}"
-        )
-    try:
-        await asyncio.to_thread(sync.ensure_case, case_id)
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e))
-    except Exception:
-        log.exception("ensure_case failed for %s", case_id)
-        raise HTTPException(500, "Failed to stage case files")
-
-    # OHIF reads the datastore MONAI Label serves; the study appears once
-    # ensure_case has linked the files into /workspace/raw_data. OHIF's
-    # StudyList URL is stable across MONAI Label versions.
-    return RedirectResponse(f"{settings.ohif_path}")
+# NOTE: The old `/open/{case_id}` click-through route is no longer needed.
+# Slicer enumerates the datastore itself, so there's no per-case "open"
+# handshake. All assigned cases are pre-staged by the landing page above.
 
 
 # --------------------------------------------------------------------------- #
@@ -584,9 +803,20 @@ async def proxy_all(path: str, request: Request):
     if path in PUBLIC_PATHS or path.startswith("auth/"):
         raise HTTPException(404)
 
-    if "user" not in request.session:
-        # Preserve the user's target so we can redirect back after login.
-        return RedirectResponse(f"/login?next=/{path}")
+    # Accept either a session cookie (browser) or an Authorization header
+    # (Slicer). Slicer can't follow OAuth redirects, so unauthenticated
+    # non-browser requests get a 401 with a WWW-Authenticate challenge
+    # instead of a redirect.
+    user = username_from_request(request)
+    if user is None:
+        ua = request.headers.get("user-agent", "")
+        if "Mozilla" in ua or "Chrome" in ua or "Safari" in ua:
+            return RedirectResponse(f"/login?next=/{path}")
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Authentication required"},
+            headers={"WWW-Authenticate": 'Basic realm="SpineSurg"'},
+        )
 
     # Lazy-load CT volumes on first reference.
     case_id = request.query_params.get("image") or request.query_params.get("label")
