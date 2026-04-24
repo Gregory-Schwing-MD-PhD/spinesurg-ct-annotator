@@ -8,8 +8,7 @@ app_port: 7860
 pinned: false
 hf_oauth: true
 hf_oauth_scopes:
-  - openid
-  - profile
+  - email 
 hf_oauth_expiration_minutes: 480
 hf_oauth_redirect_path: /auth/callback
 ---
