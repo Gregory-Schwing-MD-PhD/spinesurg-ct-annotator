@@ -399,28 +399,14 @@ async def _proxy(request: Request, path: str) -> StreamingResponse:
     )
 
 
-@app.api_route(
-    "/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
-)
-async def proxy_all(path: str, request: Request):
-    # Anonymous allow-list.
-    if path in PUBLIC_PATHS or path.startswith("auth/"):
-        raise HTTPException(404)
 
-    if "user" not in request.session:
-        # Preserve the user's target so we can redirect back after login.
-        return RedirectResponse(f"/login?next=/{path}")
+# NOTE: The catch-all proxy route is defined at the BOTTOM of this file,
+# after /, /open/{case_id}, and all other explicit handlers. FastAPI
+# dispatches in registration order, so a catch-all declared here would
+# shadow every explicit route defined later in the file (including the
+# landing page at "/"). Keep it last.
 
-    # Lazy-load CT volumes on first reference.
-    case_id = request.query_params.get("image") or request.query_params.get("label")
-    if case_id and request.method == "GET":
-        try:
-            await asyncio.to_thread(sync.ensure_case, case_id)
-        except Exception as e:
-            log.warning("ensure_case(%s) failed: %s", case_id, e)
 
-    return await _proxy(request, path)
 
 
 # --------------------------------------------------------------------------- #
@@ -529,7 +515,21 @@ async def landing(request: Request):
         cases = []
     # Don't surface the placeholder _comment field as a "case".
     cases = [c for c in cases if not c.startswith("_")]
-    return HTMLResponse(_render_landing(username, cases))
+    return HTMLResponse(
+        _render_landing(username, cases),
+        headers={
+            # Defeat aggressive browser + HF-edge caching. Without these,
+            # an old 302 (from when `/` redirected to /ohif/) or an OHIF
+            # service-worker registration can keep serving stale content
+            # even after the route is updated.
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            # Tell browsers to unregister any service workers registered on
+            # this origin. OHIF's SW can otherwise intercept navigations.
+            "Clear-Site-Data": '"cache", "storage"',
+        },
+    )
 
 
 @app.get("/open/{case_id}")
@@ -554,3 +554,46 @@ async def open_case(case_id: str, request: Request):
     # ensure_case has linked the files into /workspace/raw_data. OHIF's
     # StudyList URL is stable across MONAI Label versions.
     return RedirectResponse(f"{settings.ohif_path}")
+
+
+# --------------------------------------------------------------------------- #
+# Generic reverse proxy — MUST be registered last                             #
+#                                                                             #
+# Any @app.get / @app.post / @app.api_route declared AFTER this will never    #
+# be reached, because Starlette dispatches routes in registration order and   #
+# "/{path:path}" matches every URL (including "/", with path=""). All         #
+# explicit handlers in this file — /, /login, /logout, /auth/callback,       #
+# /healthz, /api/*, /open/{case_id}, PUT /datastore/label — are defined       #
+# above this point on purpose.                                                #
+# --------------------------------------------------------------------------- #
+
+@app.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+)
+async def proxy_all(path: str, request: Request):
+    # Belt-and-suspenders: refuse to proxy the root. The landing handler
+    # owns "/" and should have caught it before we got here, but if
+    # something upstream rewrites the request, fall through to the
+    # landing page rather than leaking MONAI Label's root (Swagger) to
+    # the user.
+    if path == "":
+        return RedirectResponse("/", status_code=307)
+
+    # Anonymous allow-list: these paths should never be proxied.
+    if path in PUBLIC_PATHS or path.startswith("auth/"):
+        raise HTTPException(404)
+
+    if "user" not in request.session:
+        # Preserve the user's target so we can redirect back after login.
+        return RedirectResponse(f"/login?next=/{path}")
+
+    # Lazy-load CT volumes on first reference.
+    case_id = request.query_params.get("image") or request.query_params.get("label")
+    if case_id and request.method == "GET":
+        try:
+            await asyncio.to_thread(sync.ensure_case, case_id)
+        except Exception as e:
+            log.warning("ensure_case(%s) failed: %s", case_id, e)
+
+    return await _proxy(request, path)
