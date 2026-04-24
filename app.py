@@ -340,7 +340,13 @@ async def save_label(request: Request, user_session=Depends(require_user)):
 
 
 async def _proxy(request: Request, path: str) -> StreamingResponse:
-    """Forward request to MONAI Label, streaming the response back."""
+    """Forward request to MONAI Label, streaming the response back.
+
+    If MONAI Label is unreachable (crashed, still booting, or not yet
+    configured), return a clean 503 instead of leaking an httpx traceback
+    into the browser. The liveness probe in the lifespan hook sets the
+    overall boot status; this is the per-request equivalent.
+    """
     upstream_url = httpx.URL(
         path=f"/{path}",
         query=request.url.query.encode("utf-8"),
@@ -360,7 +366,22 @@ async def _proxy(request: Request, path: str) -> StreamingResponse:
         headers=forward_headers,
         content=body,
     )
-    upstream = await HTTP_CLIENT.send(upstream_req, stream=True)
+    try:
+        upstream = await HTTP_CLIENT.send(upstream_req, stream=True)
+    except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+        log.error("Upstream MONAI Label unreachable for %s %s: %s",
+                  request.method, path, e)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "annotation_backend_unavailable",
+                "detail": (
+                    "MONAI Label is not responding. Check the Space's "
+                    "container logs; the service may still be starting "
+                    "or it may have crashed at boot."
+                ),
+            },
+        )
 
     response_headers = {
         k: v for k, v in upstream.headers.items()

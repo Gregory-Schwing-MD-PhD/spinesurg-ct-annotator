@@ -38,10 +38,12 @@ class Settings(BaseSettings):
     # MONAI Label subprocess
     monai_port: int = 8000
     monai_app_path: str = "/workspace/apps/radiology"
-    # Annotation-only by default: no model loaded, no GPU needed. When a
-    # trained spinesurg-ct-nnunet checkpoint is ready, set this to the
-    # bundle name to enable live pre-labeling.
-    monai_models: str = ""
+    # The radiology sample app's main.py requires at least one --conf models
+    # value or it exits at boot. 'deepedit' is the lightest option; weights
+    # only download when an annotator actually invokes inference, so pure
+    # manual annotation incurs no GPU / download cost. Switch to a spinesurg-
+    # ct-nnunet bundle here once live pre-labeling is desired.
+    monai_models: str = "deepedit"
     monai_boot_timeout_s: int = 120
     ohif_path: str = "/ohif/"
 
