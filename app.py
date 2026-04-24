@@ -82,6 +82,19 @@ async def lifespan(app: FastAPI):
     studies_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("Starting MONAI Label subprocess on port %d", settings.monai_port)
+    log.info("  app=%s  studies=%s  models=%s",
+             settings.monai_app_path, studies_dir, settings.monai_models)
+    if not Path(settings.monai_app_path).exists():
+        log.error("MONAI Label app path does not exist: %s", settings.monai_app_path)
+        log.error("Listing /opt to help diagnose:")
+        try:
+            for p in sorted(Path("/opt").rglob("sample-apps/*"))[:50]:
+                log.error("  %s", p)
+        except Exception as e:
+            log.error("  (could not list /opt: %s)", e)
+    # Inherit the parent's stdout/stderr so MONAI Label's own logs (and any
+    # crash traceback) are visible in the HF container-logs view. Without
+    # this the subprocess can fail silently behind a PIPE nobody reads.
     MONAI_PROC = subprocess.Popen(
         [
             "monailabel", "start_server",
@@ -91,8 +104,6 @@ async def lifespan(app: FastAPI):
             "--port", str(settings.monai_port),
             "--conf", "models", settings.monai_models,
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
     )
 
     HTTP_CLIENT = httpx.AsyncClient(
@@ -128,11 +139,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SpineSurg CT Annotator", lifespan=lifespan)
+# Session cookie config for OAuth on HF Spaces:
+#   • same_site="none" because the OAuth callback from huggingface.co back to
+#     <space>.hf.space is a cross-site redirect; SameSite=Lax drops the cookie
+#     on the return leg, which manifests as MismatchingStateError.
+#   • https_only=True is required once SameSite=None (browsers reject
+#     insecure cross-site cookies).
+# In local dev (settings.dev_mode=True) we relax both so http://localhost works.
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.session_secret,
     max_age=60 * 60 * 8,  # 8-hour clinical session
-    same_site="lax",
+    same_site="lax" if settings.dev_mode else "none",
     https_only=not settings.dev_mode,
 )
 
