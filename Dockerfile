@@ -28,6 +28,15 @@ ENV HOME=/home/user \
 
 RUN mkdir -p $HOME $HF_HOME && chmod -R 777 $HOME $HF_HOME
 
+# --- Pre-fetch the MONAI Label radiology sample app -------------------- #
+# The projectmonai/monailabel base image ships the `monailabel` CLI but NOT
+# the sample apps — those are downloaded on demand. Doing it at build time
+# instead of first-boot means the container starts in seconds, not minutes,
+# and failures (network hiccups, missing apps) surface during build rather
+# than runtime on HF.
+RUN monailabel apps --download --name radiology --output /workspace/apps \
+ && chmod -R 777 /workspace/apps
+
 # --- Python deps ---------------------------------------------------------- #
 WORKDIR /app
 COPY requirements.txt .
